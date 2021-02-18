@@ -6,26 +6,6 @@
 #include "types.h"
 #include "parse.h"
 
-void print_item(parser_t* parser, FILE* f, item_t* item) {
-	if (item->gen) {
-		if (!item->str) return;
-		fprintf(f, "%s", item->str);
-		return;
-	}
-
-	token_t* start = vector_get(&parser->tokens, item->span.start);
-	token_t* end = vector_get(&parser->tokens, item->span.end);
-
-	fprintf(f, "%.*s", end->start+end->len-start->start, parser->t+start->start);
-}
-
-char* item_str(parser_t* parser, item_t* item) {
-	token_t* start = vector_get(&parser->tokens, item->span.start);
-	token_t* end = vector_get(&parser->tokens, item->span.end);
-
-	return heapcpysubstr(parser->t+start->start, end->start+end->len-start->start);
-}
-
 int item_eq(parser_t* parser, item_t* i1, item_t* i2) {
 	if (i1->ty!=i2->ty || i1->body.length!=i2->body.length) return 0;
 
@@ -50,29 +30,11 @@ int item_eq(parser_t* parser, item_t* i1, item_t* i2) {
 int item_child(item_t* item, item_t* child) {
 	vector_iterator child_iter = vector_iterate(&item->body);
 	while (vector_next(&child_iter)) {
-		item_t* child_item = child_iter.x;
+		item_t* child_item = *(item_t**)child_iter.x;
 		if (child_item==child || item_child(child_item, child)) return 1;
 	}
 
 	return 0;
-}
-
-void print_item_tree_rec(parser_t* parser, vector_t* items, int depth) {
-	vector_iterator item_iter = vector_iterate(items);
-	while (vector_next(&item_iter)) {
-		item_t* item = *(item_t**)item_iter.x;
-		for (int i=0; i<depth; i++) printf("  ");
-
-		printf("%s (", ITEM_NAMES[item->ty]);
-		print_item(parser, stdout, item);
-		printf(")\n");
-
-		print_item_tree_rec(parser, &item->body, depth+1);
-	}
-}
-
-void print_item_tree(parser_t* parser) {
-	print_item_tree_rec(parser, &parser->top, 0);
 }
 
 typedef struct {
@@ -83,12 +45,12 @@ typedef struct {
 } item_iterator_t;
 
 item_iterator_t item_iterate(parser_t* parser) {
-	return (item_iterator_t){.parser=parser, .stack=vector_new(sizeof(item_t**)), .x_ref=(item_t**)vector_get(&parser->top,0)-1};
+	return (item_iterator_t){.parser=parser, .stack=vector_new(sizeof(item_t**)), .x_ref=(item_t**)vector_get(&parser->items, 0)-1};
 }
 
 void item_restart(item_iterator_t* iter) {
 	vector_clear(&iter->stack);
-	iter->x_ref = (item_t**)vector_get(&iter->parser->top,0)-1;
+	iter->x_ref = (item_t**)vector_get(&iter->parser->items, 0)-1;
 }
 
 item_t* item_parent(item_iterator_t* iter) {
@@ -96,24 +58,33 @@ item_t* item_parent(item_iterator_t* iter) {
 	return **(item_t***)vector_get(&iter->stack, iter->stack.length-1);
 }
 
-int item_next(item_iterator_t* iter) {
+item_t** item_peek_ref(item_iterator_t* iter, unsigned i) {
 	item_t*** parent_ref = vector_get(&iter->stack, iter->stack.length-1);
 
 	if (parent_ref) {
 		item_t* parent = **parent_ref;
 
-		unsigned i = (iter->x_ref+1)-(item_t**)vector_get(&parent->body, 0);
-		if (i>=parent->body.length) {
-			return 0;
+		unsigned body_i = (iter->x_ref+i)-(item_t**)vector_get(&parent->body, 0);
+		if (body_i>=parent->body.length) {
+			return NULL;
 		} else {
-			iter->x_ref++;
+			return iter->x_ref+i;
 		}
 	} else {
-		unsigned i = (iter->x_ref+1)-(item_t**)vector_get(&iter->parser->top, 0);
-		if (i>=iter->parser->top.length) return 0;
-		else iter->x_ref++;
+		unsigned top_i = (iter->x_ref+i)-(item_t**)vector_get(&iter->parser->items, 0);
+		if (top_i>=iter->parser->items.length) return NULL;
+		else return iter->x_ref+i;
 	}
-	
+}
+
+item_t* item_peek(item_iterator_t* iter, unsigned i) {
+	item_t** item_ref = item_peek_ref(iter, i);
+	return item_ref ? *item_ref : NULL;
+}
+
+int item_next(item_iterator_t* iter) {
+	iter->x_ref = item_peek_ref(iter, 1);
+	if (!iter->x_ref)	return 0;
 	iter->x = *iter->x_ref;
 
 	return 1;
@@ -128,6 +99,17 @@ void item_ascend(item_iterator_t* iter) {
 	iter->x_ref=*(item_t***)vector_get(&iter->stack, iter->stack.length-1);
 	vector_pop(&iter->stack);
 	iter->x = *iter->x_ref;
+}
+
+void item_set(item_iterator_t* iter, item_t* item) {
+	vector_t* vec = item->parent ? &item->parent->body : &iter->parser->items;
+	unsigned i = vector_search(vec, &item);
+
+	//item_ascend "returns"
+	vector_pushcpy(&iter->stack, &iter->x_ref);
+
+	iter->x_ref = vector_get(vec, i);
+	iter->x = item;
 }
 
 void item_remove(item_iterator_t* iter) {
@@ -145,13 +127,23 @@ int item_until(item_iterator_t* iter, item_ty ty) {
 	return iter->x->ty==ty;
 }
 
+//parsed and emitted irrespectively
+int item_special(item_t* item) {
+	return item->ty==item_macrocall || item->ty==item_macroeof
+			|| item->ty==item_dir || item->ty==item_include || item->ty==item_define;
+}
+
 item_t* item_get(item_iterator_t* iter, unsigned i) {
 	for (unsigned n=0; n<=i; n++) {
 		item_next(iter);
-		if (iter->x->ty==item_macrocall) n--;
+		if (item_special(iter->x)) n--;
 	}
 
 	return iter->x;
+}
+
+void item_iterator_free(item_iterator_t* iter) {
+	vector_free(&iter->stack);
 }
 
 typedef struct {
@@ -167,10 +159,26 @@ typedef struct {
 } process_t;
 
 item_t* scope_get(item_t* item) {
+	if (!item) return NULL;
+
 	while (1) {
+		item=item->parent;
 		if (!item) return NULL;
 		else if (item->ty==item_block) return item;
-		item=item->parent;
+	}
+}
+
+item_t* item_iter_scope(item_iterator_t* iter) {
+	if (iter->stack.length>0) {
+		item_t* parent = item_parent(iter);
+
+		while (1) {
+			if (parent==NULL) return NULL;
+			else if (parent->ty==item_block) return parent;
+			else parent = parent->parent;
+		}
+	} else {
+		return scope_get(iter->x);
 	}
 }
 
@@ -244,8 +252,8 @@ int scope_exits_early(process_t* proc, item_t* origin) {
 		scope_t* sc = proc->iter.x->scope;
 		vector_iterator exit_iter = vector_iterate(&sc->exits);
 		while (vector_next(&exit_iter)) {
-			item_t* exit = exit_iter.x;
-			if (exit==origin || item_child(exit, origin)) return 1;
+			exit_t* exit = exit_iter.x;
+			if (exit->exit_scope==origin || item_child(exit->exit_scope, origin)) return 1;
 		}
 	}
 
@@ -287,13 +295,17 @@ void tag_items(process_t* proc) {
 				item_t* parent = item_parent(&proc->iter);
 
 				sc->ret = parent->ty==item_func;
-				sc->br = parent->ty==item_while || parent->ty==item_for;
+				sc->br = parent->ty==item_while || parent->ty==item_for
+						|| parent->ty==item_dowhile || parent->ty==item_while || parent->ty==item_switch;
 
 				item_descend(&proc->iter);
 				tag_items(proc);
 				item_ascend(&proc->iter);
 
 				scope_exit(proc, sc);
+
+				if (proc->iter.x->ty==item_switch) item_ascend(&proc->iter);
+
 				break;
 			}
 
@@ -388,14 +400,14 @@ void process_scope(process_t* proc) {
 					while (map_insertcpy_noexist(&proc->name_label, &label_str, &label).exists)
 						label_str = straffix(label_str, "_");
 
-					label_name->str=label_str;
+					label_name->str=heapcpystr(label_str);
 				}
 
 				unsigned ex_i = vector_search(&ex2->item->parent->body, &ex2->item);
 
 				item_t* goto_item = item_new(proc, item_goto, ex2->item, ex2->item->parent);
 				item_t* goto_label_name = item_push(proc, item_name, goto_item, goto_item);
-				goto_label_name->str=label_str;
+				goto_label_name->str=heapcpystr(label_str);
 
 				vector_setcpy(&ex2->item->parent->body, ex_i, &goto_item);
 			}
@@ -405,10 +417,10 @@ void process_scope(process_t* proc) {
 
 		if (ex) {
 			scope_item = proc->iter.x;
-			while (scope_item!=ex->exit_scope) {
+			while (scope_item && scope_item!=ex->exit_scope->parent) {
 				deferred_iter = vector_iterate_end(&scope_item->scope->deferred);
 				while (vector_prev(&deferred_iter)) {
-					item_t* deferred = deferred_iter.x;
+					item_t* deferred = *(item_t**)deferred_iter.x;
 					vector_pushcpy(&proc->iter.x->body, &deferred);
 				}
 
@@ -433,27 +445,36 @@ void process_scope(process_t* proc) {
 			unsigned ex_i = vector_search(&ex->item->parent->body, &ex->item);
 
 			scope_item = proc->iter.x;
-			do {
+			while (scope_item && scope_item!=ex->exit_scope->parent) {
 				vector_iterator deferred_iter = vector_iterate_end(&scope_item->scope->deferred);
+				if (scope_item==proc->iter.x) deferred_iter.i = ex->defer_i;
+
 				while (vector_prev(&deferred_iter)) {
-					item_t* deferred = deferred_iter.x;
+					item_t* deferred = *(item_t**)deferred_iter.x;
 					vector_insertcpy(&ex->item->parent->body, ex_i, &deferred);
 				}
 
 				scope_item=scope_get(scope_item);
-			} while (scope_item!=ex->exit_scope);
+			}
 		}
 	}
 }
 
 void process(process_t* proc) {
-	item_t* current = scope_get(item_parent(&proc->iter));
-
+	item_t* current=item_iter_scope(&proc->iter);
 	while (item_next(&proc->iter)) {
 		switch (proc->iter.x->ty) {
 			case item_block:
 			case item_func: {
 				process_scope(proc);
+				break;
+			}
+
+			case item_switch: {
+				item_descend(&proc->iter);
+				item_get(&proc->iter, 1);
+				process_scope(proc);
+				item_ascend(&proc->iter);
 				break;
 			}
 
@@ -513,6 +534,8 @@ void process(process_t* proc) {
 
 			default:;
 		}
+
+		if (proc->parser->stop) return;
 	}
 }
 
@@ -532,4 +555,19 @@ process_t process_new(parser_t* parser)	{
 	process(&proc);
 
 	return proc;
+}
+
+void process_free(process_t* proc) {
+	map_free(&proc->name_label);
+	map_free(&proc->name_item);
+	vector_free_strings(&proc->names);
+
+	vector_iterator obj_iter = vector_iterate(&proc->objs);
+	while (vector_next(&obj_iter)) {
+		drop(*(void**)obj_iter.x);
+	}
+
+	vector_free(&proc->objs);
+
+	item_iterator_free(&proc->iter);
 }

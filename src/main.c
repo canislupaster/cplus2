@@ -2,6 +2,7 @@
 
 #include "parse.h"
 #include "syntax.h"
+#include "emit.h"
 
 int main(int argc, char** argv) {
 	for (int i=1; i<argc; i++) {
@@ -24,6 +25,12 @@ int main(int argc, char** argv) {
 
 		print_item_tree(&p);
 
+		process_free(&proc);
+
+		FILE* out = fopen("./testout.c", "w");
+		emit("test.c", out, &p);
+
+		parser_free(&p);
 	}
 
 	return 0;
